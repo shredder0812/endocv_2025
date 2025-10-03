@@ -1,0 +1,67 @@
+content/
+video_test_x/
+model_yolo/
+
+boxmot/.vscode/
+boxmot/.venv/
+boxmot/.eggs/
+boxmot/env/
+boxmot/*.DS_Store
+boxmot/.coverage
+boxmot/htmlcov/
+# interpreter bytecode
+boxmot/__pycache__/
+boxmot/__MACOSX/
+
+# experiment results
+boxmot/runs/
+boxmot/videos/
+
+# experiment files
+boxmot/*.pkl
+
+# partial downlaods
+boxmot/*.part
+
+# Downloaded weights
+boxmot/weights/*.pt
+boxmot/weights/*.torchscript
+boxmot/weights/*.onnx
+boxmot/weights/*_openvino_model
+boxmot/weights/*.engine
+boxmot/weights/*.tflite
+
+# evaluation tools folder
+boxmot/val_utils/
+
+# zip files
+*.zip
+
+# exports
+boxmot/*_openvino_model
+boxmot/*.torchscript
+*.pt
+*.pth
+*.onnx
+*.engine
+
+# interactive plots
+*.html
+
+# tf models
+*saved_model/
+tf_models/
+
+# distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# cmc debug images
+boxmot/boxmot/motion/cmc/*.jpg
+boxmot/.git
+boxmot/.github
+
+
+# json outputs
+*_output.json

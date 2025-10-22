@@ -297,7 +297,7 @@ class ObjectDetection:
         self.iou_threshold = iou_threshold
         self.use_frame_id = use_frame_id
         # Virtual box confidence for missed frames
-        self.virtual_conf = 0.1
+        self.virtual_conf = 0.6
 
     def _load_model(self, weights):
         """Tải và cấu hình mô hình YOLO."""
@@ -306,7 +306,7 @@ class ObjectDetection:
         return model
     
     def predict(self, frame):
-        results = self.model(frame, stream=True, verbose=False, conf=0.45, line_width=1)
+        results = self.model(frame, stream=True, verbose=False, conf=0.6, line_width=1)
         return results
 
     def _initialize_tracker(self):
@@ -318,7 +318,7 @@ class ObjectDetection:
             fp16=False,
             max_dist=0.95,
             max_iou_dist=0.95,
-            max_age=300,
+            max_age=30,
             half=False,
         )
 
@@ -508,20 +508,13 @@ class ObjectDetection:
 
                 for dets in detections:
                     det_boxes = dets.boxes.data.to("cpu").numpy()
-                    # Always call tracker.update, even if no detections
                     if det_boxes.size > 0:
                         tracks = tracker.update(det_boxes, frame)
-                    else:
-                        tracks = tracker.update(np.empty((0, 6), dtype=np.float32), frame)
-                    # Draw and log for every frame; _draw_tracks will also write virtuals
-                    if len(tracks.shape) == 2 and tracks.shape[1] == 8 and tracks.size > 0:
-                        if len(previous_tracks) > 0:
-                            tracks = self._update_track_id(tracks, previous_tracks)
-                        frame = self._draw_tracks(frame, tracks, txt_file)
-                        previous_tracks = tracks
-                    else:
-                        # No real tracks this frame; still draw to allow virtual logging
-                        frame = self._draw_tracks(frame, np.empty((0, 8), dtype=np.float32), txt_file)
+                        if len(tracks.shape) == 2 and tracks.shape[1] == 8:
+                            if len(previous_tracks) > 0:
+                                tracks = self._update_track_id(tracks, previous_tracks)
+                            frame = self._draw_tracks(frame, tracks, txt_file)
+                            previous_tracks = tracks
 
                 end_time = perf_counter()
                 fps = 1 / (end_time - start_time)

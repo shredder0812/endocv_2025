@@ -3,7 +3,7 @@ Implementation of Kalman filter specifically designed for tracking objects
 using position (x, y), scale (s) and aspect ratio (r).
 """ 
 
-from typing import Tuple, List, Optional, Callable, Dict, Any
+from typing import Tuple
 from copy import deepcopy
 from collections import deque
 from math import log, exp
@@ -31,31 +31,6 @@ def logpdf(x, mean, cov):
     mahal = dot(dot(diff.T, inv(cov)), diff)[0, 0]
     return -0.5 * (dim * np_log(2 * np.pi) + np_log(np.linalg.det(cov)) + mahal)
 
-_eps = 1e-6
-
-def s_r_to_w_h(s: float, r: float):
-    """Convert scale s (area) and ratio r to width w and height h."""
-    s = float(s)
-    r = float(max(r, _eps))
-    w = np.sqrt(max(s * r, 0.0))
-    h = np.sqrt(max(s / r, 0.0))
-    return w, h
-
-def w_h_to_s_r(w: float, h: float):
-    """Convert width and height to scale s and ratio r."""
-    w = float(max(w, _eps))
-    h = float(max(h, _eps))
-    s = w * h
-    r = w / h
-    return s, r
-
-def cosine_similarity_vec(a: np.ndarray, b: np.ndarray, eps=1e-8):
-    """Compute cosine similarity between two vectors."""
-    a = a.reshape(-1)
-    b = b.reshape(-1)
-    na = np.linalg.norm(a) + eps
-    nb = np.linalg.norm(b) + eps
-    return float(np.dot(a, b) / (na * nb))
 
 
 class KalmanFilterXYSR(BaseKalmanFilter):
@@ -155,48 +130,6 @@ class KalmanFilterXYSR(BaseKalmanFilter):
             1e-5                                       # vr
         ])
         return std_pos, std_vel
-
-    def interpolate_virtual_boxes(self, z1: np.ndarray, z2: np.ndarray, t1: int, t2: int, max_gap: int = 50) -> List[np.ndarray]:
-        """Generate virtual measurements between z1 at t1 and z2 at t2.
-
-        Parameters
-        ----------
-        z1, z2 : ndarray
-            Measurements in format (x,y,s,r) at times t1, t2
-        t1, t2 : int
-            Frame indices of measurements
-        max_gap : int
-            Maximum number of frames to interpolate
-
-        Returns
-        -------
-        list[ndarray]
-            List of virtual measurements, each in (x,y,s,r) format
-        """
-        time_gap = int(t2 - t1)
-        if time_gap <= 1 or time_gap > max_gap:
-            return []
-
-        x1, y1, s1, r1 = map(float, z1)
-        x2, y2, s2, r2 = map(float, z2)
-
-        w1, h1 = s_r_to_w_h(s1, r1)
-        w2, h2 = s_r_to_w_h(s2, r2)
-
-        dx = (x2 - x1) / time_gap
-        dy = (y2 - y1) / time_gap
-        dw = (w2 - w1) / time_gap
-        dh = (h2 - h1) / time_gap
-
-        virtual_boxes = []
-        for k in range(1, time_gap):
-            xv = x1 + k * dx
-            yv = y1 + k * dy
-            wv = w1 + k * dw
-            hv = h1 + k * dh
-            sv, rv = w_h_to_s_r(wv, hv)
-            virtual_boxes.append(np.array([xv, yv, sv, rv], dtype=float))
-        return virtual_boxes
 
     def project(self, mean, covariance):
         """Project state distribution to measurement space.
@@ -328,32 +261,30 @@ class KalmanFilterXYSR(BaseKalmanFilter):
         """
         self.attr_saved = deepcopy(self.__dict__)
 
-    def unfreeze(self, conf_virtual_default=0.3):
-        """Restore saved state and apply virtual trajectory with reduced confidence."""
+    def unfreeze(self):
         if self.attr_saved is not None:
-            # Get history and timestamps
             new_history = deepcopy(list(self.history_obs))
             self.__dict__ = self.attr_saved
             self.history_obs = deque(list(self.history_obs)[:-1], maxlen=self.max_obs)
             occur = [int(d is None) for d in new_history]
             indices = np.where(np.array(occur) == 0)[0]
-            
-            if len(indices) < 2:
-                return
-                
             index1, index2 = indices[-2], indices[-1]
             box1, box2 = new_history[index1], new_history[index2]
+            x1, y1, s1, r1 = box1
+            w1, h1 = np.sqrt(s1 * r1), np.sqrt(s1 / r1)
+            x2, y2, s2, r2 = box2
+            w2, h2 = np.sqrt(s2 * r2), np.sqrt(s2 / r2)
             time_gap = index2 - index1
-            
-            # Generate virtual boxes
-            virtual_boxes = self.interpolate_virtual_boxes(
-                box1, box2, index1, index2, max_gap=50
-            )
-            
-            # Apply virtual trajectory
-            for i, v_box in enumerate(virtual_boxes):
-                self.update(v_box, confidence=conf_virtual_default)
-                if i < len(virtual_boxes) - 1:
+            dx, dy = (x2 - x1) / time_gap, (y2 - y1) / time_gap
+            dw, dh = (w2 - w1) / time_gap, (h2 - h1) / time_gap
+
+            for i in range(index2 - index1):
+                x, y = x1 + (i + 1) * dx, y1 + (i + 1) * dy
+                w, h = w1 + (i + 1) * dw, h1 + (i + 1) * dh
+                s, r = w * h, w / float(h)
+                new_box = np.array([x, y, s, r])
+                self.update(new_box)
+                if not i == (index2 - index1 - 1):
                     self.predict()
                     self.history_obs.pop()
             self.history_obs.pop()
@@ -459,118 +390,6 @@ class KalmanFilterXYSR(BaseKalmanFilter):
         """
         return exp(self.compute_log_likelihood(measurement))
 
-
-    def apply_virtual_trajectory(
-        self,
-        track: Any,
-        z1: np.ndarray, t1: int,
-        z2: np.ndarray, t2: int,
-        frames: Optional[Dict[int, Any]] = None,
-        crop_fn: Optional[Callable] = None,
-        extract_feature: Optional[Callable] = None,
-        theta_sim: float = 0.65,
-        conf_virtual_default: float = 0.30,
-        conf_virtual_if_sim_high: Tuple[float, float] = (0.6, 0.9),
-        max_gap: int = 30,
-        add_virtual_to_track: Optional[Callable] = None,
-    ) -> List[Tuple[int, np.ndarray, Optional[float]]]:
-        """Apply virtual trajectory between measurements z1 and z2.
-
-        Parameters
-        ----------
-        track : Any
-            Track object to which virtual boxes may be added
-        z1, t1 : ndarray, int
-            Last real measurement and its timestamp
-        z2, t2 : ndarray, int
-            New real measurement and its timestamp
-        frames : dict, optional
-            Dict mapping frame_idx -> frame for appearance check
-        crop_fn : callable, optional
-            Function(frame, x,y,w,h) -> cropped image
-        extract_feature : callable, optional
-            Function(crop) -> 1D embedding
-        theta_sim : float
-            Similarity threshold for accepting virtual boxes
-        conf_virtual_default : float
-            Default confidence for virtual measurements
-        conf_virtual_if_sim_high : tuple
-            (low, high) confidence range when similarity is high
-        max_gap : int
-            Maximum frames to interpolate
-        add_virtual_to_track : callable, optional
-            Function(track, box, virtual_flag) to add boxes to track
-
-        Returns
-        -------
-        list
-            List of (frame_idx, virtual_box, similarity) that were accepted
-        """
-        accepted_virtuals = []
-        time_gap = int(t2 - t1)
-        if time_gap <= 1 or time_gap > max_gap:
-            self.update(z2, confidence=1.0)
-            if add_virtual_to_track:
-                add_virtual_to_track(track, z2, virtual=False)
-            return accepted_virtuals
-
-        # Create virtual boxes
-        virtual_boxes = self.interpolate_virtual_boxes(z1, z2, t1, t2, max_gap)
-
-        # Get appearance feature of z2 if possible
-        Fo = None
-        if all(x is not None for x in [frames, crop_fn, extract_feature]) and t2 in frames:
-            x2, y2, s2, r2 = z2
-            w2, h2 = s_r_to_w_h(s2, r2)
-            crop_obs = crop_fn(frames[t2], x2, y2, w2, h2)
-            Fo = extract_feature(crop_obs)
-
-        # Process virtual boxes
-        for idx, z_hat in enumerate(virtual_boxes, start=1):
-            frame_idx = t1 + idx
-            sim = None
-
-            # Appearance check if possible
-            if Fo is not None and all(x is not None for x in [frames, crop_fn, extract_feature]) and frame_idx in frames:
-                xh, yh, sh, rh = z_hat
-                wh, hh = s_r_to_w_h(sh, rh)
-                crop_v = crop_fn(frames[frame_idx], xh, yh, wh, hh)
-                Fv = extract_feature(crop_v)
-                sim = cosine_similarity_vec(Fo, Fv)
-
-            # Determine confidence and acceptance
-            if sim is None:
-                conf = conf_virtual_default
-                accept_for_output = False
-            else:
-                if sim >= theta_sim:
-                    # High similarity -> stronger confidence
-                    low, high = conf_virtual_if_sim_high
-                    frac = min(1.0, max(0.0, (sim - theta_sim) / (1.0 - theta_sim + 1e-8)))
-                    conf = low + frac * (high - low)
-                    accept_for_output = True
-                else:
-                    conf = min(conf_virtual_default, 0.2)
-                    accept_for_output = False
-
-            # Update KF with virtual measurement
-            self.update(z_hat, confidence=conf)
-
-            # Add to track if accepted
-            if accept_for_output and add_virtual_to_track is not None:
-                add_virtual_to_track(track, z_hat, virtual=True)
-                accepted_virtuals.append((frame_idx, z_hat, sim))
-
-            # Predict if not last virtual box
-            if idx != len(virtual_boxes):
-                self.predict()
-
-        # Finally update with real observation
-        self.update(z2, confidence=1.0)
-        if add_virtual_to_track is not None:
-            add_virtual_to_track(track, z2, virtual=False)
-
-        return accepted_virtuals
 
     def batch_filter(self, zs: list, Rs: list = None) -> Tuple[np.ndarray, np.ndarray]:
         """

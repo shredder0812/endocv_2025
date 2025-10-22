@@ -7,7 +7,7 @@ import cv2
 import numpy as np
 import torch
 from ultralytics import YOLO
-from boxmot import StrongSortXYSR
+from boxmot import StrongSort, StrongSortXYSR, StrongSortTLUKF
 from datetime import datetime, timedelta
 import numpy as np
 
@@ -275,10 +275,10 @@ class Colors:
         return tuple(map(int, self.color_palette[class_id % self.num_colors]))
 
 class ObjectDetection:
-    """Lớp thực hiện phát hiện và theo dõi đối tượng trong video sử dụng YOLO và StrongSort."""
+    """Lớp thực hiện phát hiện và theo dõi đối tượng trong video sử dụng YOLO và StrongSort hoặc TLUKF."""
 
     def __init__(self, model_weights, capture_path, output_dir, min_temporal_threshold=0, max_temporal_threshold=0,
-                 iou_threshold=0.2, use_frame_id=False):
+                 iou_threshold=0.2, use_frame_id=False, tracker_type="xysr"):
         self.device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
         print(f"Using Device: {self.device}")
         self.model = self._load_model(model_weights)
@@ -291,6 +291,7 @@ class ObjectDetection:
         self.video_folder = self.output_dir / self.capture_path.stem
         self.video_folder.mkdir(parents=True, exist_ok=True)
         self.cap = self._load_capture()
+        self.tracker_type = tracker_type
         self.tracker = self._initialize_tracker()
         self.min_temporal_threshold = min_temporal_threshold
         self.max_temporal_threshold = max_temporal_threshold
@@ -306,21 +307,41 @@ class ObjectDetection:
         return model
     
     def predict(self, frame):
-        results = self.model(frame, stream=True, verbose=False, conf=0.45, line_width=1)
+        # TLUKF Strategy: Get ALL detections including low-confidence ones
+        # - Source tracker: Will filter and use only conf ≥ 0.6 (high quality)
+        # - Primary tracker: Will use ALL detections conf ≥ 0.3 (including low-conf)
+        # - Transfer Learning: Primary learns from Source during gaps
+        results = self.model(frame, stream=True, verbose=False, conf=0.3, line_width=1)
         return results
 
     def _initialize_tracker(self):
-        """Khởi tạo StrongSortXYSR với hỗ trợ quỹ đạo ảo trong lõi tracker."""
+        """Khởi tạo tracker phù hợp: StrongSortXYSR hoặc TLUKF."""
         reid_weights = Path("osnet_dcn_x0_5_endocv.pt")
-        return StrongSortXYSR(
-            reid_weights,
-            torch.device(self.device),
-            fp16=False,
-            max_dist=0.95,
-            max_iou_dist=0.95,
-            max_age=300,
-            half=False,
-        )
+        if self.tracker_type == "tlukf":
+            # Khởi tạo tracker TLUKF
+            return StrongSortTLUKF(
+                metric=None,  # TODO: truyền metric nếu cần
+                max_iou_dist=0.95,
+                max_age=300,
+                n_init=3,
+                _lambda=0,
+                ema_alpha=0.9,
+                mc_lambda=0.995,
+                reid_weights=reid_weights,
+                device=torch.device(self.device),
+                half=False,
+            )
+        else:
+            # Mặc định dùng StrongSortXYSR
+            return StrongSortXYSR(
+                reid_weights,
+                torch.device(self.device),
+                fp16=False,
+                max_dist=0.95,
+                max_iou_dist=0.95,
+                max_age=300,
+                half=False,
+            )
 
     def _load_capture(self):
         """Tải video từ đường dẫn và cấu hình VideoWriter."""
@@ -374,6 +395,98 @@ class ObjectDetection:
         box2_area = (box2[2] - box2[0] + 1) * (box2[3] - box2[1] + 1)
         union = box1_area + box2_area - intersection
         return intersection / union if union > 0 else 0
+    
+    def _apply_nms_to_tracks(self, tracks, iou_threshold=0.5):
+        """
+        Apply NMS to remove overlapping boxes with priority:
+        1. Same ID: Strong > Weak > Virtual (keep only ONE box per ID)
+        2. Different IDs but overlapping: Real (strong/weak) > Virtual
+        3. Multiple virtual boxes for same ID: Keep the one closest in state space to real box
+        
+        Args:
+            tracks: numpy array of tracks [x1, y1, x2, y2, id, conf, cls, det_ind]
+            iou_threshold: IoU threshold for considering boxes as overlapping
+            
+        Returns:
+            Filtered tracks after NMS
+        """
+        if len(tracks) == 0:
+            return tracks
+        
+        # Step 1: Group tracks by ID
+        id_to_tracks = {}
+        for i, track in enumerate(tracks):
+            track_id = int(track[4])
+            if track_id not in id_to_tracks:
+                id_to_tracks[track_id] = []
+            id_to_tracks[track_id].append((i, track))
+        
+        # Step 2: For each ID, keep only ONE box (highest priority)
+        final_tracks = []
+        
+        for track_id, track_list in id_to_tracks.items():
+            # Separate into real and virtual
+            real_boxes = [(i, t) for i, t in track_list if t[5] >= 0.35]  # conf >= 0.35
+            virtual_boxes = [(i, t) for i, t in track_list if t[5] < 0.35]  # conf < 0.35
+            
+            if len(real_boxes) > 0:
+                # CASE 1: Has real detection(s) - keep the highest confidence real box
+                real_boxes.sort(key=lambda x: x[1][5], reverse=True)  # Sort by conf descending
+                best_real = real_boxes[0][1]
+                final_tracks.append(best_real)
+                
+            elif len(virtual_boxes) > 0:
+                # CASE 2: Only virtual boxes - keep first one (highest confidence)
+                final_tracks.append(virtual_boxes[0][1])
+        
+        # Step 3: Apply spatial NMS for different IDs + LIMIT virtual boxes
+        # Sort by confidence for spatial overlap check
+        final_tracks = np.array(final_tracks)
+        if len(final_tracks) == 0:
+            return np.array([])
+            
+        sorted_indices = np.argsort(-final_tracks[:, 5])  # Sort by conf descending
+        sorted_tracks = final_tracks[sorted_indices]
+        
+        keep = []
+        virtual_count = 0  # Track number of virtual boxes kept
+        MAX_VIRTUAL_PER_FRAME = 1  # CRITICAL: Only 1 virtual box allowed per frame
+        
+        for i, track in enumerate(sorted_tracks):
+            track_id = int(track[4])
+            track_conf = track[5]
+            track_box = track[:4]
+            is_virtual = track_conf < 0.35
+            
+            # Limit virtual boxes per frame
+            if is_virtual and virtual_count >= MAX_VIRTUAL_PER_FRAME:
+                continue
+            
+            should_keep = True
+            for kept_idx in keep:
+                kept_track = sorted_tracks[kept_idx]
+                kept_id = int(kept_track[4])
+                kept_conf = kept_track[5]
+                kept_box = kept_track[:4]
+                
+                # Skip if same ID (already handled above)
+                if kept_id == track_id:
+                    continue
+                
+                iou = self._calculate_iou(track_box, kept_box)
+                
+                if iou > iou_threshold:
+                    # Suppress virtual if real exists
+                    if track_conf < 0.35 and kept_conf >= 0.35:
+                        should_keep = False
+                        break
+            
+            if should_keep:
+                keep.append(i)
+                if is_virtual:
+                    virtual_count += 1
+        
+        return sorted_tracks[keep]
 
     def _update_track_id(self, current_tracks, previous_tracks):
         """Cập nhật ID của các track dựa trên IoU."""
@@ -400,56 +513,63 @@ class ObjectDetection:
         timestamp_hms = self._frame_idx_to_hms(frame_id)
         timestamp_hmsf = self._frame_idx_to_hmsf(frame_id)
         frame_rate = self.cap.get(cv2.CAP_PROP_FPS)
-        null_notes = "Tracking"
 
-        # Vẽ các track thực
+        # Process all tracks and separate real vs virtual based on confidence
         for track in tracks:
             x1, y1, x2, y2 = map(int, track[:4])
             id_ = int(track[4])
             conf = round(track[5], 2)
             class_id = int(track[6])
             class_name = self.classes[class_id]
-            cv2.rectangle(frame, (x1, y1), (x2, y2), self.colors(class_id), 5)
-            label = f'{class_name}, ID: {id_}'
-            (w, h), _ = cv2.getTextSize(label, self.font, 1.5, 5)
-            cv2.rectangle(frame, (x1, y1 + h + 15), (x1 + w, y1), self.colors(class_id), -1)
-            cv2.putText(frame, label, (x1, y1 + h + 10), self.font, 1.5, (255, 255, 255), 3)
+            
+            # TLUKF: Distinguish by confidence and update status
+            # - High conf (≥0.6): Strong detection (Source + Primary updated)
+            # - Low conf (0.3-0.6): Weak detection (only Primary updated) 
+            # - Very low conf (0.3): Virtual/predicted box (no detection, using TLUKF prediction)
+            
+            if conf >= 0.6:
+                # Strong detection - both trackers updated
+                color = self.colors(class_id)
+                thickness = 5
+                label = f'{class_name}, ID: {id_}, conf: {conf}'
+                notes = "Tracking"
+            elif conf >= 0.35:
+                # Weak detection - only Primary updated (TLUKF advantage)
+                color = (255, 165, 0)  # Orange - between real and virtual
+                thickness = 3
+                label = f'Low-conf {class_name}, ID: {id_}, conf: {conf}'
+                notes = "Tracking"  # Still a real detection, just low confidence
+            else:
+                # Virtual box - TLUKF prediction (Transfer Learning active)
+                color = (128, 128, 128)  # Gray
+                thickness = 2
+                label = f'Virtual {class_name}, ID: {id_}, conf: {conf}'
+                notes = "Virtual"
+            
+            # Draw rectangle
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+            
+            # Draw label - adjust font size based on box type
+            if conf >= 0.6:
+                font_scale = 1.5
+                font_thickness = 3
+            elif conf >= 0.35:
+                font_scale = 1.2
+                font_thickness = 2
+            else:
+                font_scale = 1.0
+                font_thickness = 2
+            
+            (w, h), _ = cv2.getTextSize(label, self.font, font_scale, font_thickness)
+            cv2.rectangle(frame, (x1, y1 + h + 15), (x1 + w, y1), color, -1)
+            cv2.putText(frame, label, (x1, y1 + h + 10), self.font, font_scale, (255, 255, 255), font_thickness)
+            
+            # Log to file
             center_x = (x1 + x2) / 2
             center_y = (y1 + y2) / 2
-            txt_file.write(f"{timestamp_hms},{timestamp_hmsf},{frame_id},{frame_rate},{class_name},{id_},{id_},{null_notes},"
+            txt_file.write(f"{timestamp_hms},{timestamp_hmsf},{frame_id},{frame_rate},{class_name},{id_},{id_},{notes},"
                            f"{frame.shape[0]},{frame.shape[1]},{frame.shape[0]},{frame.shape[1]},{x1},{y1},{x2},{y2},"
                            f"{center_x},{center_y}\n")
-
-        # Vẽ các hộp giới hạn ảo cho những track bị miss ở frame hiện tại
-        if hasattr(self.tracker, 'tracker') and hasattr(self.tracker.tracker, 'tracks'):
-            for t in self.tracker.tracker.tracks:
-                # Bỏ qua các track chưa xác nhận hoặc vừa được cập nhật
-                if not t.is_confirmed() or t.time_since_update < 1:
-                    continue
-                # Lấy bbox ước lượng hiện tại từ KF
-                vx1, vy1, vx2, vy2 = map(int, t.to_tlbr())
-                # Ràng buộc vào khung ảnh
-                vx1 = max(0, min(vx1, frame.shape[1] - 1))
-                vx2 = max(0, min(vx2, frame.shape[1] - 1))
-                vy1 = max(0, min(vy1, frame.shape[0] - 1))
-                vy2 = max(0, min(vy2, frame.shape[0] - 1))
-                if vx2 <= vx1 or vy2 <= vy1:
-                    continue
-                vid_ = int(getattr(t, 'id', getattr(t, 'track_id', -1)))
-                vconf = round(self.virtual_conf, 2)
-                vclass_id = 0
-                vclass_name = self.classes[vclass_id] if hasattr(self, 'classes') else 'virtual'
-                # Vẽ khung xám và ghi log
-                cv2.rectangle(frame, (vx1, vy1), (vx2, vy2), (128, 128, 128), 2)
-                vlabel = f'Virtual, ID: {vid_}'
-                (vw, vh), _ = cv2.getTextSize(vlabel, self.font, 1.0, 2)
-                cv2.rectangle(frame, (vx1, vy1 + vh + 10), (vx1 + vw, vy1), (128, 128, 128), -1)
-                cv2.putText(frame, vlabel, (vx1, vy1 + vh + 8), self.font, 1.0, (255, 255, 255), 2)
-                vcenter_x = (vx1 + vx2) / 2
-                vcenter_y = (vy1 + vy2) / 2
-                txt_file.write(f"{timestamp_hms},{timestamp_hmsf},{frame_id},{frame_rate},{vclass_name},{vid_},{vid_},Virtual,"
-                               f"{frame.shape[0]},{frame.shape[1]},{frame.shape[0]},{frame.shape[1]},{vx1},{vy1},{vx2},{vy2},"
-                               f"{vcenter_x},{vcenter_y}\n")
 
         return frame
 
@@ -508,13 +628,35 @@ class ObjectDetection:
 
                 for dets in detections:
                     det_boxes = dets.boxes.data.to("cpu").numpy()
-                    # Always call tracker.update, even if no detections
+                    
+                    # TLUKF: Pass ALL detections to tracker
+                    # - Tracker will internally handle Source (conf ≥ 0.6) vs Primary (all conf ≥ 0.3)
+                    # - No need to split here - let TLUKF's dual-tracker architecture handle it
                     if det_boxes.size > 0:
                         tracks = tracker.update(det_boxes, frame)
                     else:
                         tracks = tracker.update(np.empty((0, 6), dtype=np.float32), frame)
-                    # Draw and log for every frame; _draw_tracks will also write virtuals
+                    
+                    # CRITICAL FIX: Remove duplicate tracks (same ID in one frame)
                     if len(tracks.shape) == 2 and tracks.shape[1] == 8 and tracks.size > 0:
+                        frame_id = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
+                        
+                        # Apply NMS to remove duplicate/overlapping tracks
+                        tracks = self._apply_nms_to_tracks(tracks, iou_threshold=0.1)
+                        
+                        # Final safety check: Ensure one box per ID
+                        unique_tracks = {}
+                        for track in tracks:
+                            track_id = int(track[4])
+                            if track_id not in unique_tracks:
+                                unique_tracks[track_id] = track
+                            else:
+                                # Keep higher confidence box
+                                if track[5] > unique_tracks[track_id][5]:
+                                    unique_tracks[track_id] = track
+                        
+                        tracks = np.array(list(unique_tracks.values()))
+                        
                         if len(previous_tracks) > 0:
                             tracks = self._update_track_id(tracks, previous_tracks)
                         frame = self._draw_tracks(frame, tracks, txt_file)
@@ -542,14 +684,15 @@ class ObjectDetection:
 
 def main():
     """Chức năng chính để xử lý video với các tham số từ argparse."""
-    parser = argparse.ArgumentParser(description="Object Detection and Tracking using YOLO and StrongSort")
+    parser = argparse.ArgumentParser(description="Object Detection and Tracking using YOLO and StrongSort/TLUKF")
     parser.add_argument("--video_dir", type=str, default="video_test_x", help="Thư mục chứa video đầu vào")
     parser.add_argument("--model_dir", type=str, default="model_yolo", help="Thư mục chứa mô hình YOLO")
-    parser.add_argument("--output_dir", type=str, default="content/runs_3vids_xysr_vt", help="Thư mục đầu ra cho kết quả")
+    parser.add_argument("--output_dir", type=str, default="content/runs_3vids_xysr_vt_tlukf", help="Thư mục đầu ra cho kết quả")
     parser.add_argument("--min_temporal_threshold", type=float, default=0, help="Ngưỡng thời gian tối thiểu")
     parser.add_argument("--max_temporal_threshold", type=float, default=0, help="Ngưỡng thời gian tối đa")
     parser.add_argument("--iou_threshold", type=float, default=0.2, help="Ngưỡng IoU cho cập nhật ID")
     parser.add_argument("--use_frame_id", action="store_true", help="Sử dụng frame ID để tính thời gian")
+    parser.add_argument("--tracker_type", type=str, default="tlukf", choices=["xysr", "tlukf"], help="Chọn loại tracker: xysr hoặc tlukf")
 
     args = parser.parse_args()
 
@@ -566,7 +709,7 @@ def main():
                 else model_dir / "daday.pt" if "UTDD" in video_path.parts
                 else model_dir / "htt.pt"
             )
-            print(f"Processing video: {video_path} with model: {model_weights}")
+            print(f"Processing video: {video_path} with model: {model_weights} | Tracker: {args.tracker_type}")
             detector = ObjectDetection(
                 model_weights=str(model_weights),
                 capture_path=video_path,
@@ -574,7 +717,8 @@ def main():
                 min_temporal_threshold=args.min_temporal_threshold,
                 max_temporal_threshold=args.max_temporal_threshold,
                 iou_threshold=args.iou_threshold,
-                use_frame_id=args.use_frame_id
+                use_frame_id=args.use_frame_id,
+                tracker_type=args.tracker_type
             )
             start_video_time = perf_counter()
             detector()

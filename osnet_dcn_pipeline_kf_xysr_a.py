@@ -12,6 +12,19 @@ from datetime import datetime, timedelta
 import numpy as np
 
 class EndoStrongSort(StrongSortXYSR):
+    def split_detections(self, dets, conf_main=0.6, conf_virtual=0.3):
+        """
+        Tách detection thành hai nhóm:
+        - main: conf >= conf_main
+        - virtual: conf_virtual <= conf < conf_main
+        """
+        dets = np.array(dets)
+        if dets.shape[1] < 5:
+            return dets, np.empty((0, dets.shape[1]))
+        main_mask = dets[:, 4] >= conf_main
+        virtual_mask = (dets[:, 4] >= conf_virtual) & (dets[:, 4] < conf_main-0.1)
+        return dets[main_mask], dets[virtual_mask]
+
     def _crop_bbox(self, img, bbox):
         """Crop ảnh từ bbox dạng [x1, y1, x2, y2] với kiểm tra biên."""
         x1, y1, x2, y2 = map(int, bbox)
@@ -197,11 +210,10 @@ class EndoStrongSort(StrongSortXYSR):
         return boxes
 
     def update(self, dets, img):
-        """Update with always-on virtual trajectory support.
-        
-        Args:
-            dets: numpy array of detections
-            img: current frame image
+        """
+        Update tracker với hai mức detection:
+        - main: conf >= 0.6 (update track như bình thường)
+        - virtual: 0.3 <= conf < 0.6 (chỉ dùng cho quỹ đạo ảo)
         """
         self.frame_idx += 1
         # Update frame buffer
@@ -209,27 +221,49 @@ class EndoStrongSort(StrongSortXYSR):
             self.frame_buffer[self.frame_idx] = img.copy()
             if len(self.frame_buffer) > self.max_buffer_size:
                 del self.frame_buffer[min(self.frame_buffer.keys())]
-        # Process detections
-        dets_processed = self.preprocess_dets(dets)
-        # Extract features for current detections
-        if len(dets_processed) > 0:
+        # Tách detection thành hai nhóm
+        dets_main, dets_virtual = self.split_detections(dets, conf_main=0.6, conf_virtual=0.3)
+        # Xử lý nhóm main như bình thường
+        dets_main_processed = self.preprocess_dets(dets_main)
+        if len(dets_main_processed) > 0:
             if hasattr(self.tracker, "model") and hasattr(self.tracker.model, "get_features"):
-                det_features = self.tracker.model.get_features(img, dets_processed[:, :4])
+                det_features_main = self.tracker.model.get_features(img, dets_main_processed[:, :4])
             else:
-                det_features = []
+                det_features_main = []
         else:
-            det_features = []
-        # Update virtual trajectories
-        self._process_virtual_trajectories(dets_processed, det_features, img)
-        # Luôn sinh box ảo cho các track bị miss
-        for track in self.tracker.tracks:
-            if track.is_confirmed() and track.time_since_update > 0:
-                # Dự đoán vị trí ảo cho frame hiện tại
-                predicted_box = track.kf.predict()[0]
-                if not hasattr(track, 'virtual_boxes'):
-                    track.virtual_boxes = []
-                track.virtual_boxes.append((self.frame_idx, predicted_box))
-        return super().update(dets, img)
+            det_features_main = []
+        # Update tracker với detection chuẩn
+        output = super().update(dets_main_processed, img)
+        # Xử lý box ảo cho các track bị miss
+        if len(dets_virtual) > 0:
+            # Trích xuất feature cho box ảo
+            # if hasattr(self.tracker, "model") and hasattr(self.tracker.model, "get_features"):
+            virtual_features = self.tracker.model.get_features(img, dets_virtual[:, :4])
+            # else:
+                # virtual_features = []
+            # Duyệt các track bị miss
+            for track in self.tracker.tracks:
+                if track.is_confirmed() and track.time_since_update > 0:
+                    # Lấy feature cuối cùng của track
+                    if hasattr(track, 'features') and track.features:
+                        last_feat = track.features[-1]
+                        best_sim = self.appearance_thresh
+                        best_idx = -1
+                        for i, vfeat in enumerate(virtual_features):
+                            sim = self._cosine_similarity(vfeat, last_feat)
+                            if sim > best_sim:
+                                best_sim = sim
+                                best_idx = i
+                                
+                                
+                        # if best_idx >= 0:
+                        # Nếu similarity vượt ngưỡng, dùng box ảo để nối quỹ đạo
+                        vbox = dets_virtual[best_idx, :4]
+                        track.kf.update(vbox, confidence=self.virtual_conf)
+                        if not hasattr(track, 'virtual_boxes'):
+                            track.virtual_boxes = []
+                        track.virtual_boxes.append((self.frame_idx, vbox))
+        return output
         
     # Remove duplicate _cosine_similarity and _interpolate_boxes
 
@@ -297,7 +331,7 @@ class ObjectDetection:
         self.iou_threshold = iou_threshold
         self.use_frame_id = use_frame_id
         # Virtual box confidence for missed frames
-        self.virtual_conf = 0.1
+        self.virtual_conf = 0.6
 
     def _load_model(self, weights):
         """Tải và cấu hình mô hình YOLO."""
@@ -306,7 +340,7 @@ class ObjectDetection:
         return model
     
     def predict(self, frame):
-        results = self.model(frame, stream=True, verbose=False, conf=0.45, line_width=1)
+        results = self.model(frame, stream=True, verbose=False, conf=0.4, line_width=1)
         return results
 
     def _initialize_tracker(self):
@@ -318,7 +352,7 @@ class ObjectDetection:
             fp16=False,
             max_dist=0.95,
             max_iou_dist=0.95,
-            max_age=300,
+            max_age=30,
             half=False,
         )
 
@@ -508,20 +542,13 @@ class ObjectDetection:
 
                 for dets in detections:
                     det_boxes = dets.boxes.data.to("cpu").numpy()
-                    # Always call tracker.update, even if no detections
                     if det_boxes.size > 0:
                         tracks = tracker.update(det_boxes, frame)
-                    else:
-                        tracks = tracker.update(np.empty((0, 6), dtype=np.float32), frame)
-                    # Draw and log for every frame; _draw_tracks will also write virtuals
-                    if len(tracks.shape) == 2 and tracks.shape[1] == 8 and tracks.size > 0:
-                        if len(previous_tracks) > 0:
-                            tracks = self._update_track_id(tracks, previous_tracks)
-                        frame = self._draw_tracks(frame, tracks, txt_file)
-                        previous_tracks = tracks
-                    else:
-                        # No real tracks this frame; still draw to allow virtual logging
-                        frame = self._draw_tracks(frame, np.empty((0, 8), dtype=np.float32), txt_file)
+                        if len(tracks.shape) == 2 and tracks.shape[1] == 8:
+                            if len(previous_tracks) > 0:
+                                tracks = self._update_track_id(tracks, previous_tracks)
+                            frame = self._draw_tracks(frame, tracks, txt_file)
+                            previous_tracks = tracks
 
                 end_time = perf_counter()
                 fps = 1 / (end_time - start_time)
@@ -545,7 +572,7 @@ def main():
     parser = argparse.ArgumentParser(description="Object Detection and Tracking using YOLO and StrongSort")
     parser.add_argument("--video_dir", type=str, default="video_test_x", help="Thư mục chứa video đầu vào")
     parser.add_argument("--model_dir", type=str, default="model_yolo", help="Thư mục chứa mô hình YOLO")
-    parser.add_argument("--output_dir", type=str, default="content/runs_3vids_xysr_vt", help="Thư mục đầu ra cho kết quả")
+    parser.add_argument("--output_dir", type=str, default="content/runs_3vids_xysr_vt11", help="Thư mục đầu ra cho kết quả")
     parser.add_argument("--min_temporal_threshold", type=float, default=0, help="Ngưỡng thời gian tối thiểu")
     parser.add_argument("--max_temporal_threshold", type=float, default=0, help="Ngưỡng thời gian tối đa")
     parser.add_argument("--iou_threshold", type=float, default=0.2, help="Ngưỡng IoU cho cập nhật ID")

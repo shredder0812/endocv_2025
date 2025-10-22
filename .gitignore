@@ -33,10 +33,10 @@ boxmot/weights/*.tflite
 
 # evaluation tools folder
 boxmot/val_utils/
-
+_MConverter.eu_Phân tích chi tiết phương pháp TL-UKF.md
 # zip files
 *.zip
-
+*.mp4
 # exports
 boxmot/*_openvino_model
 boxmot/*.torchscript
@@ -47,7 +47,7 @@ boxmot/*.torchscript
 
 # interactive plots
 *.html
-
+*.ipynb
 # tf models
 *saved_model/
 tf_models/

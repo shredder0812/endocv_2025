@@ -545,7 +545,7 @@ def main():
     parser = argparse.ArgumentParser(description="Object Detection and Tracking using YOLO and StrongSort")
     parser.add_argument("--video_dir", type=str, default="video_test_x", help="Thư mục chứa video đầu vào")
     parser.add_argument("--model_dir", type=str, default="model_yolo", help="Thư mục chứa mô hình YOLO")
-    parser.add_argument("--output_dir", type=str, default="content/runs_3vids_xysr_vt", help="Thư mục đầu ra cho kết quả")
+    parser.add_argument("--output_dir", type=str, default="content2410/runs_kf_xysr_vbox", help="Thư mục đầu ra cho kết quả")
     parser.add_argument("--min_temporal_threshold", type=float, default=0, help="Ngưỡng thời gian tối thiểu")
     parser.add_argument("--max_temporal_threshold", type=float, default=0, help="Ngưỡng thời gian tối đa")
     parser.add_argument("--iou_threshold", type=float, default=0.2, help="Ngưỡng IoU cho cập nhật ID")

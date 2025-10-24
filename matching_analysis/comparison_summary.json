@@ -1,0 +1,37 @@
+{
+  "video": "video_test_x/UTTQ/230411BVK106_Trim2.mp4",
+  "trackers": [
+    "strongsort",
+    "strongsort_xysr",
+    "tlukf"
+  ],
+  "results": {
+    "strongsort": {
+      "total_tracks": 4,
+      "total_frames_processed": 403,
+      "matching_events": 12,
+      "id_switches": 0,
+      "tracks_lost": 8,
+      "tracks_recovered": 4,
+      "virtual_boxes_created": 0
+    },
+    "strongsort_xysr": {
+      "total_tracks": 4,
+      "total_frames_processed": 403,
+      "matching_events": 828,
+      "id_switches": 0,
+      "tracks_lost": 0,
+      "tracks_recovered": 0,
+      "virtual_boxes_created": 828
+    },
+    "tlukf": {
+      "total_tracks": 12,
+      "total_frames_processed": 403,
+      "matching_events": 337,
+      "id_switches": 0,
+      "tracks_lost": 5,
+      "tracks_recovered": 40,
+      "virtual_boxes_created": 292
+    }
+  }
+}

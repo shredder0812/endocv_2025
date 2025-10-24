@@ -237,10 +237,9 @@ class Track:
         self.kf = KalmanFilterXYAH()
         
         # Set initial state
-        self.kf.initiate(self.bbox)
-        # Get the state from the filter
-        self.mean = self.kf.x.copy()
-        self.covariance = self.kf.P.copy()
+        mean, covariance = self.kf.initiate(self.bbox)
+        self.mean = mean
+        self.covariance = covariance
 
     def to_tlwh(self):
         """Get current position in bounding box format `(top left x, top left y,
@@ -297,9 +296,7 @@ class Track:
         Kalman filter prediction step.
         """
         # Update Kalman filter state
-        self.kf.predict()
-        self.mean = self.kf.x
-        self.covariance = self.kf.P
+        self.mean, self.covariance = self.kf.predict(self.mean, self.covariance)
         self.age += 1
         self.time_since_update += 1
 
@@ -317,9 +314,9 @@ class Track:
         self.det_ind = detection.det_ind
         
         # Update Kalman filter with new measurement
-        self.kf.update(self.bbox, self.conf)
-        self.mean = self.kf.x
-        self.covariance = self.kf.P
+        self.mean, self.covariance = self.kf.update(
+            self.mean, self.covariance, self.bbox, self.conf
+        )
 
         feature = detection.feat / np.linalg.norm(detection.feat)
 

@@ -1,0 +1,38 @@
+{
+  "total_frames": 403,
+  "trackers": {
+    "StrongSort (XYAH)": {
+      "id_switches": 0,
+      "new_ids": 6,
+      "total_id_issues": 6,
+      "unique_ids": 7,
+      "gating_rate": 0.0,
+      "avg_cost": 0.2568511472983086,
+      "avg_matches_per_frame": 1.1904761904761905,
+      "conflicts": 396,
+      "problematic_frames_count": 7
+    },
+    "StrongSortXYSR": {
+      "id_switches": 0,
+      "new_ids": 8,
+      "total_id_issues": 8,
+      "unique_ids": 9,
+      "gating_rate": 0.0,
+      "avg_cost": 0.26212561964067205,
+      "avg_matches_per_frame": 1.1820728291316527,
+      "conflicts": 396,
+      "problematic_frames_count": 71
+    },
+    "TLUKF": {
+      "id_switches": 0,
+      "new_ids": 5,
+      "total_id_issues": 5,
+      "unique_ids": 6,
+      "gating_rate": 0.0,
+      "avg_cost": 0.23020468305368894,
+      "avg_matches_per_frame": 1.1932773109243697,
+      "conflicts": 331,
+      "problematic_frames_count": 74
+    }
+  }
+}

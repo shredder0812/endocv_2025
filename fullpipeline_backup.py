@@ -407,45 +407,95 @@ class ObjectDetection:
     
     def _apply_nms_to_tracks(self, tracks, iou_threshold=0.5):
         """
-        CRITICAL: Keep ONLY ONE box per frame with highest priority.
-        Priority: Real box (conf >= 0.35) > Virtual box (conf < 0.35)
-        Within same category: Higher confidence > Lower confidence
+        Apply NMS to remove overlapping boxes with priority:
+        1. Same ID: Strong > Weak > Virtual (keep only ONE box per ID)
+        2. Different IDs but overlapping: Real (strong/weak) > Virtual
+        3. Multiple virtual boxes for same ID: Keep the one closest in state space to real box
         
         Args:
             tracks: numpy array of tracks [x1, y1, x2, y2, id, conf, cls, det_ind]
-            iou_threshold: Not used - we always keep only 1 box
+            iou_threshold: IoU threshold for considering boxes as overlapping
             
         Returns:
-            Single track (best box) or empty array
+            Filtered tracks after NMS
         """
         if len(tracks) == 0:
             return tracks
         
-        # Step 1: Separate real and virtual boxes
-        real_boxes = []
-        virtual_boxes = []
+        # Step 1: Group tracks by ID
+        id_to_tracks = {}
+        for i, track in enumerate(tracks):
+            track_id = int(track[4])
+            if track_id not in id_to_tracks:
+                id_to_tracks[track_id] = []
+            id_to_tracks[track_id].append((i, track))
         
-        for track in tracks:
-            conf = track[5]
-            if conf >= 0.35:
-                real_boxes.append(track)
-            else:
-                virtual_boxes.append(track)
+        # Step 2: For each ID, keep only ONE box (highest priority)
+        final_tracks = []
         
-        # Step 2: Select ONLY ONE box with highest priority
-        if len(real_boxes) > 0:
-            # Priority 1: Real box with highest confidence
-            real_boxes_sorted = sorted(real_boxes, key=lambda t: t[5], reverse=True)
-            best_box = real_boxes_sorted[0]
-        elif len(virtual_boxes) > 0:
-            # Priority 2: Virtual box with highest confidence (if no real box)
-            virtual_boxes_sorted = sorted(virtual_boxes, key=lambda t: t[5], reverse=True)
-            best_box = virtual_boxes_sorted[0]
-        else:
+        for track_id, track_list in id_to_tracks.items():
+            # Separate into real and virtual
+            real_boxes = [(i, t) for i, t in track_list if t[5] >= 0.35]  # conf >= 0.35
+            virtual_boxes = [(i, t) for i, t in track_list if t[5] < 0.35]  # conf < 0.35
+            
+            if len(real_boxes) > 0:
+                # CASE 1: Has real detection(s) - keep the highest confidence real box
+                real_boxes.sort(key=lambda x: x[1][5], reverse=True)  # Sort by conf descending
+                best_real = real_boxes[0][1]
+                final_tracks.append(best_real)
+                
+            elif len(virtual_boxes) > 0:
+                # CASE 2: Only virtual boxes - keep first one (highest confidence)
+                final_tracks.append(virtual_boxes[0][1])
+        
+        # Step 3: Apply spatial NMS for different IDs + LIMIT virtual boxes
+        # Sort by confidence for spatial overlap check
+        final_tracks = np.array(final_tracks)
+        if len(final_tracks) == 0:
             return np.array([])
+            
+        sorted_indices = np.argsort(-final_tracks[:, 5])  # Sort by conf descending
+        sorted_tracks = final_tracks[sorted_indices]
         
-        # Return as 2D array for consistency
-        return np.array([best_box])
+        keep = []
+        virtual_count = 0  # Track number of virtual boxes kept
+        MAX_VIRTUAL_PER_FRAME = 1  # CRITICAL: Only 1 virtual box allowed per frame
+        
+        for i, track in enumerate(sorted_tracks):
+            track_id = int(track[4])
+            track_conf = track[5]
+            track_box = track[:4]
+            is_virtual = track_conf < 0.35
+            
+            # Limit virtual boxes per frame
+            if is_virtual and virtual_count >= MAX_VIRTUAL_PER_FRAME:
+                continue
+            
+            should_keep = True
+            for kept_idx in keep:
+                kept_track = sorted_tracks[kept_idx]
+                kept_id = int(kept_track[4])
+                kept_conf = kept_track[5]
+                kept_box = kept_track[:4]
+                
+                # Skip if same ID (already handled above)
+                if kept_id == track_id:
+                    continue
+                
+                iou = self._calculate_iou(track_box, kept_box)
+                
+                if iou > iou_threshold:
+                    # Suppress virtual if real exists
+                    if track_conf < 0.35 and kept_conf >= 0.35:
+                        should_keep = False
+                        break
+            
+            if should_keep:
+                keep.append(i)
+                if is_virtual:
+                    virtual_count += 1
+        
+        return sorted_tracks[keep]
 
     def _update_track_id(self, current_tracks, previous_tracks):
         """Cập nhật ID của các track dựa trên IoU."""
@@ -596,14 +646,27 @@ class ObjectDetection:
                     else:
                         tracks = tracker.update(np.empty((0, 6), dtype=np.float32), frame)
                     
-                    # CRITICAL FIX: Apply NMS to keep ONLY ONE box per frame
+                    # CRITICAL FIX: Remove duplicate tracks (same ID in one frame)
                     if len(tracks.shape) == 2 and tracks.shape[1] == 8 and tracks.size > 0:
                         frame_id = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
                         
-                        # Apply NMS - returns ONLY ONE box (highest priority)
+                        # Apply NMS to remove duplicate/overlapping tracks
                         tracks = self._apply_nms_to_tracks(tracks, iou_threshold=0.001)
                         
-                        # Update track IDs and draw
+                        # Final safety check: Ensure one box per ID
+                        unique_tracks = {}
+                        for track in tracks:
+                            track_id = int(track[4])
+                            if track_id not in unique_tracks:
+                                unique_tracks[track_id] = track
+                            else:
+                                # Keep higher confidence box
+                                if track[5] > unique_tracks[track_id][5]:
+                                    unique_tracks[track_id] = track
+                        
+                        tracks = np.array(list(unique_tracks.values()))
+                        
+                        # old logic
                         if len(previous_tracks) > 0:
                             tracks = self._update_track_id(tracks, previous_tracks)
                         frame = self._draw_tracks(frame, tracks, txt_file)

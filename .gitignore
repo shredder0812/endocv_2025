@@ -1,7 +1,7 @@
-content*/
+conten*/
 video_test_x/
 model_yolo/
-
+data/
 boxmot/.vscode/
 boxmot/.venv/
 boxmot/.eggs/

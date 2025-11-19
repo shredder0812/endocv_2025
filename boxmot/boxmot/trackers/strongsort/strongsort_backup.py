@@ -504,25 +504,24 @@ class StrongSortTLUKF(BaseTracker):
 
         # output bbox identities
         outputs = []
-        
-        # CRITICAL FIX: Single loop to output ONLY ONE box per track
-        # Prevents duplicate outputs (both real and virtual for same track)
-        # 
-        # Logic:
-        # - time_since_update == 0: Track matched → output REAL box
-        # - time_since_update >= 1: Track unmatched → output VIRTUAL box
-        # Each track enters EXACTLY ONE branch - no duplicates possible
+        seen_ids = set()  # Track which IDs we've already output
         
         for track in self.tracker.tracks:
             if not track.is_confirmed():
                 continue
             
-            # CRITICAL: Check time_since_update to determine box type
-            # time_since_update == 0: Track was matched this frame → Real box
-            # time_since_update >= 1: Track was NOT matched → Virtual box (predicted)
+            # DEBUG: Log track state
+            # print(f"Track ID {track.id}: time_since_update={track.time_since_update}, conf={track.conf:.3f}")
             
-            if track.time_since_update == 0:
-                # MATCHED TRACK: Output real detection with original confidence
+            # Skip if we already output this ID
+            if track.id in seen_ids:
+                continue
+            
+            # CRITICAL FIX: Only ONE box per track per frame!
+            # Real box (matched this frame) OR Virtual box (missed this frame)
+            
+            if track.time_since_update < 1:
+                # Real detection - OUTPUT WITH REAL CONFIDENCE
                 x1, y1, x2, y2 = track.to_tlbr()
                 id = track.id
                 conf = track.conf  # Real confidence from detection
@@ -534,30 +533,39 @@ class StrongSortTLUKF(BaseTracker):
                         ([x1, y1, x2, y2], [id], [conf], [cls], [det_ind])
                     ).reshape(1, -1)
                 )
-            elif track.time_since_update >= 1:
-                # UNMATCHED TRACK: Output virtual box with predicted position
-                # TLUKF has already applied transfer learning in TrackerTLUKF.update()
+                seen_ids.add(id)  # Mark this ID as output
+            else:
+                # Virtual box (missed detection) - OUTPUT WITH LOW CONFIDENCE
+                # Use TLUKF predicted position (non-linear motion model)
                 x1, y1, x2, y2 = track.to_tlbr()
                 
-                # Validate virtual box dimensions before output
+                # CRITICAL FIX: Validate virtual box before output
+                # Skip if box dimensions are invalid
                 if x2 <= x1 or y2 <= y1:
                     continue
                 
+                # Skip if box area is too small (likely corrupted)
                 box_width = x2 - x1
                 box_height = y2 - y1
                 box_area = box_width * box_height
-                
-                # Skip degenerate or tiny boxes
-                if box_area < 100:  # Minimum 100 pixels
+                min_area = 100  # Minimum 100 pixels (e.g., 10x10)
+                if box_area < min_area:
                     continue
                 
-                # Skip boxes with unreasonable aspect ratio
+                # Skip if box has degenerate coordinates (points overlapping)
+                # Check if any coordinates are exactly the same or too close
+                epsilon = 1.0  # Minimum 1 pixel difference
+                if abs(x2 - x1) < epsilon or abs(y2 - y1) < epsilon:
+                    continue
+                
+                # Skip if box aspect ratio is unreasonable
                 aspect_ratio = box_width / box_height if box_height > 0 else 0
-                if aspect_ratio < 0.1 or aspect_ratio > 10.0:
+                if aspect_ratio < 0.1 or aspect_ratio > 10.0:  # Too thin or too wide
                     continue
-                
+                    
                 id = track.id
-                conf = 0.3  # Low confidence for virtual boxes
+                # Lower confidence for virtual boxes (easy to distinguish)
+                conf = 0.3  # Virtual box confidence
                 cls = track.cls
                 det_ind = getattr(track, 'det_ind', 0)
                 
@@ -566,27 +574,11 @@ class StrongSortTLUKF(BaseTracker):
                         ([x1, y1, x2, y2], [id], [conf], [cls], [det_ind])
                     ).reshape(1, -1)
                 )
+                seen_ids.add(id)  # Mark this ID as output
             
         if len(outputs) > 0:
             outputs = np.concatenate(outputs)
-            
-            # VALIDATION: Check for duplicate IDs (should NEVER happen with new logic)
-            unique_ids = set()
-            duplicate_ids = []
-            for output in outputs:
-                track_id = int(output[4])
-                if track_id in unique_ids:
-                    duplicate_ids.append(track_id)
-                else:
-                    unique_ids.add(track_id)
-            
-            if duplicate_ids:
-                # DEBUG: Log duplicate IDs for investigation
-                import warnings
-                warnings.warn(f"CRITICAL: Duplicate track IDs in same frame: {duplicate_ids}")
-                # This should NEVER happen after our fix - if it does, we have a bug
-            
-            # Apply NMS to remove overlapping boxes (belt-and-suspenders approach)
+            # Apply NMS to remove overlapping boxes
             outputs = self._apply_nms(outputs, iou_threshold=0.5)
             return outputs
         return np.array([])

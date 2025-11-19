@@ -1,0 +1,29 @@
+{
+  "total_frames": 403,
+  "trackers": {
+    "StrongSort (XYAH)": {
+      "id_switches": 77,
+      "gating_rate": 0.0,
+      "avg_cost": 0.2568511472983086,
+      "avg_matches_per_frame": 1.1904761904761905,
+      "conflicts": 379,
+      "problematic_frames_count": 78
+    },
+    "StrongSortXYSR": {
+      "id_switches": 60,
+      "gating_rate": 0.0,
+      "avg_cost": 0.26212561964067205,
+      "avg_matches_per_frame": 1.1820728291316527,
+      "conflicts": 370,
+      "problematic_frames_count": 63
+    },
+    "TLUKF": {
+      "id_switches": 0,
+      "gating_rate": 0.0,
+      "avg_cost": 0.23020468305368894,
+      "avg_matches_per_frame": 1.1932773109243697,
+      "conflicts": 59,
+      "problematic_frames_count": 0
+    }
+  }
+}
